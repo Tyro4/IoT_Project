@@ -11,63 +11,135 @@
 #include <time.h>
 #include <math.h>
 
-#define PIN_ANALOG_IN 34
-#define PIN_LIGHT 32
+//DEVICE WIFI AND MQTT VARIABLES
 #define WIFI_SSID "Wiha Ratcheting Screwdriver"
 #define WIFI_PASSWORD "house101"
 #define MQTT_HOST "broker.emqx.io"
 #define MQTT_PORT 1883
 
 #define TOPIC_SENSOR "firestation_esp32/sensors"
-#define TOPIC_PERFORMANCE "firestation_esp32/performance"
 #define TZ_INFO "AEST-10AEDT,M10.1.0,M4.1.0/3"
 
 #define GROUP_ID "Group1"
 #define LOCATION "firestation"
 #define DEVICE_TYPE "ESP32"
 
-const unsigned long SAMPLE_INTERVAL = 2000;
-const unsigned long RETRY_INTERVAL = 5000;
-const int BATCH_SIZE = 3;
-volatile float TEMP_THRESHOLD = 30.0f;
-
-#define BLE_SERVER_NAME "firestation_esp32"
-#define BLE_SERVICE_UUID "7ab9d8b0-27fb-4b3a-a735-c79c27ab8ef1"
-#define BLE_THRESHOLD_UUID "9d34f7c2-333d-473b-bc32-79c2bae6dae6"
-BLECharacteristic* thresholdCharacteristic = nullptr;
-
-const float LIGHT_THRESHOLD = 1000.0f;
 WiFiMulti wifiMulti;
 WiFiClient net;
 PubSubClient mqtt(net);
 String deviceId;
 
+//BATCHING VARIABLES SETUP
+const unsigned long SAMPLE_INTERVAL = 2000;
+const unsigned long RETRY_INTERVAL = 5000;
+const int BATCH_SIZE = 3;
 unsigned long lastSample = 0, lastRetry = 0, sessionStart = 0;
-unsigned long violations = 0, totalPublishedBytes = 0;
-unsigned long totalPublishedPoints = 0, publishAttempts = 0, publishFailures = 0;
-unsigned long intervalBytes = 0;
-int intervalPoints = 0;
 
-class ThresholdCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* characteristic) override {
-    auto raw = characteristic->getValue();
-    String input(raw.c_str());
-    input.trim();
 
-    char* end = nullptr;
-    errno = 0;
-    float value = strtof(input.c_str(), &end);
+//BLE VARIABLES SETUP
+#define BLE_SERVER_NAME "fire_esp32"
+#define BLE_TEMP_SERVICE_UUID "7ab9d8b0-27fb-4b3a-a735-c79c27ab8ef1"
+#define BLE_LIGHT_SERVICE_UUID "7ab9d8b0-27fb-4b3a-a735-c79c27ab8ef2"
+#define BLE_THRESHOLD_UUID "9d34f7c2-333d-473b-bc32-79c2bae6dae6"
 
-    if (input.length() == 0 || end == input.c_str() || *end != '\0' || errno == ERANGE || !isfinite(value) || value < 0.0f || value > 100.0f) {
-      Serial.println("BLE: invalid threshold (enter -20 to 100 Celsius)");
-      characteristic->setValue(String((float)TEMP_THRESHOLD, 2).c_str());
-      return;
+BLECharacteristic tempHighChar("9d34f7c2-333d-473b-bc32-79c2bae6dae1", BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+BLECharacteristic tempExtremeChar("9d34f7c2-333d-473b-bc32-79c2bae6dae2", BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+BLECharacteristic tempCatastrophicChar("9d34f7c2-333d-473b-bc32-79c2bae6dae3", BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+
+BLECharacteristic lightHighChar("9d34f7c2-333d-473b-bc32-79c2bae6dae4", BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+BLECharacteristic lightExtremeChar("9d34f7c2-333d-473b-bc32-79c2bae6dae5", BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+BLECharacteristic lightCatastrophicChar("9d34f7c2-333d-473b-bc32-79c2bae6dae6", BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+
+//GLOBAL VARIABLES
+String fireRisk = "";
+String waterStatus = "";
+float temperature = 0.0, waterPercentage = 0.0;
+int lightLevel = 0;
+
+// GENERAL PIN DEFINITIONS
+#define THERMISTOR_PIN 32
+#define LDR_PIN 34
+
+// ULTRASONIC SENSOR PINS + DEFINITIONS
+#define trigPin 13 // define trigPin
+#define echoPin 14 // define echoPin.
+#define MAX_DISTANCE 700 // Maximum sensor distance is rated at 400-500cm.
+float timeOut = MAX_DISTANCE * 60;
+int soundVelocity = 340; // define sound speed=340m/s
+unsigned long pingTime;
+float distance;
+
+// LDR CHANNEL AND LIGHT LEVEL RANGE
+#define CHAN 0
+#define LIGHT_MIN 0
+#define LIGHT_MAX 3560
+
+// FIRE RISK LEVELS
+const String FIRE_MODERATE = "Moderate";
+const String FIRE_HIGH = "High";
+const String FIRE_EXTREME = "Extreme";
+const String FIRE_CATASTROPHIC = "Catastrophic";
+
+// WATER STATUS LEVELS
+const String WATER_CRITICAL = "Critical";
+const String WATER_LOW = "Low";
+const String WATER_MODERATE = "Moderate";
+const String WATER_FULL = "Full";
+
+//LEVEL THRESHOLDS
+int TEMP_HIGH_THRESHOLD = 28;
+int TEMP_EXTREME_THRESHOLD = 30;
+int TEMP_CATASTROPHIC_THRESHOLD = 32;
+
+int LIGHT_HIGH_THRESHOLD = 80;
+int LIGHT_EXTREME_THRESHOLD = 50;
+int LIGHT_CATASTROPHIC_THRESHOLD = 20;
+
+// SENSOR FUNCTION DECLARATIONS
+void readTemperature();
+void readSensors();
+void calculateFireRisk();
+void calculateWaterStatus();
+void printStatus();
+
+class ThresholdCallback : public BLECharacteristicCallbacks {
+private:
+    int* threshold;
+    const char* name;
+
+public:
+    ThresholdCallback(int* thresholdPtr, const char* label) : threshold(thresholdPtr), name(label) {}
+
+    void onWrite(BLECharacteristic* characteristic) override {
+        std::string value = characteristic->getValue();
+        if (value.empty()) return;
+
+        //check if input is wihtin bounds
+        char* endPtr;
+        long newValue = strtol(value.c_str(), &endPtr, 10);
+        if (endPtr == value.c_str() || *endPtr != '\0' || newValue < 0 || newValue > 100) {
+            Serial.println("Invalid threshold value");
+            characteristic->setValue(String(*threshold).c_str());
+            return;
+        }
+        //check is input is within threshold values
+        int oldValue = *threshold;
+        *threshold = (int)newValue;
+        bool tempValid = TEMP_HIGH_THRESHOLD < TEMP_EXTREME_THRESHOLD && TEMP_EXTREME_THRESHOLD < TEMP_CATASTROPHIC_THRESHOLD;
+        bool lightValid = LIGHT_HIGH_THRESHOLD > LIGHT_EXTREME_THRESHOLD && LIGHT_EXTREME_THRESHOLD > LIGHT_CATASTROPHIC_THRESHOLD;
+
+        if (!tempValid || !lightValid) {
+            *threshold = oldValue;
+            characteristic->setValue(String(oldValue).c_str());
+            Serial.println("Rejected: thresholds must remain ordered");
+            return;
+        }
+
+        characteristic->setValue(String(*threshold).c_str());
+        Serial.print(name);
+        Serial.print(" saved: ");
+        Serial.println(*threshold);
     }
-
-    TEMP_THRESHOLD = value;
-    characteristic->setValue(String(value, 2).c_str());
-    Serial.printf("BLE - temperature threshold changed to %.2f C\n", value);
-  }
 };
 
 class BleServerCallbacks : public BLEServerCallbacks {
@@ -79,61 +151,138 @@ class BleServerCallbacks : public BLEServerCallbacks {
 };
 
 void setupBLE() {
+  //Create server and assign services
   BLEDevice::init(BLE_SERVER_NAME);
   BLEServer* server = BLEDevice::createServer();
   server->setCallbacks(new BleServerCallbacks());
-  BLEService* service = server->createService(BLE_SERVICE_UUID);
+  BLEService* tempService = server->createService(BLE_TEMP_SERVICE_UUID);
+  BLEService* lightService = server->createService(BLE_LIGHT_SERVICE_UUID);
 
-  thresholdCharacteristic = service->createCharacteristic(BLE_THRESHOLD_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
-  thresholdCharacteristic->setCallbacks(new ThresholdCallbacks());
-  thresholdCharacteristic->setValue(String((float)TEMP_THRESHOLD, 2).c_str());
+  //Add characteristics to services
+  tempService->addCharacteristic(&tempHighChar);
+  tempService->addCharacteristic(&tempExtremeChar);
+  tempService->addCharacteristic(&tempCatastrophicChar);
 
-  BLEDescriptor* description = new BLEDescriptor(BLEUUID((uint16_t)0x2901));
-  description->setValue("Temperature threshold in Celsius (0 to 100)");
-  thresholdCharacteristic->addDescriptor(description);
+  lightService->addCharacteristic(&lightHighChar);
+  lightService->addCharacteristic(&lightExtremeChar);
+  lightService->addCharacteristic(&lightCatastrophicChar);
 
-  service->start();
-  server->getAdvertising()->addServiceUUID(BLE_SERVICE_UUID);
+  //assign callbacks to chars
+  tempHighChar.setCallbacks(new ThresholdCallback(&TEMP_HIGH_THRESHOLD, "Temperature HIGH"));
+  tempExtremeChar.setCallbacks(new ThresholdCallback(&TEMP_EXTREME_THRESHOLD, "Temperature EXTREME"));
+  tempCatastrophicChar.setCallbacks(new ThresholdCallback(&TEMP_CATASTROPHIC_THRESHOLD, "Temperature CATASTROPHIC"));
+
+  lightHighChar.setCallbacks(new ThresholdCallback(&LIGHT_HIGH_THRESHOLD, "Light HIGH"));
+  lightExtremeChar.setCallbacks(new ThresholdCallback(&LIGHT_EXTREME_THRESHOLD, "Light EXTREME"));
+  lightCatastrophicChar.setCallbacks(new ThresholdCallback(&LIGHT_CATASTROPHIC_THRESHOLD, "Light CATASTROPHIC"));
+
+  //assign threshold variables to chars
+  tempHighChar.setValue(String(TEMP_HIGH_THRESHOLD).c_str());
+  tempExtremeChar.setValue(String(TEMP_EXTREME_THRESHOLD).c_str());
+  tempCatastrophicChar.setValue(String(TEMP_CATASTROPHIC_THRESHOLD).c_str());
+
+  lightHighChar.setValue(String(LIGHT_HIGH_THRESHOLD).c_str());
+  lightExtremeChar.setValue(String(LIGHT_EXTREME_THRESHOLD).c_str());
+  lightCatastrophicChar.setValue(String(LIGHT_CATASTROPHIC_THRESHOLD).c_str());
+
+  // Descriptions
+  BLEDescriptor* tempHighDesc = new BLEDescriptor(BLEUUID((uint16_t)0x2901));
+  tempHighDesc->setValue("Temperature HIGH threshold (C)");
+  tempHighChar.addDescriptor(tempHighDesc);
+
+  BLEDescriptor* tempExtremeDesc = new BLEDescriptor(BLEUUID((uint16_t)0x2901));
+  tempExtremeDesc->setValue("Temperature EXTREME threshold (C)");
+  tempExtremeChar.addDescriptor(tempExtremeDesc);
+
+  BLEDescriptor* tempCatDesc = new BLEDescriptor(BLEUUID((uint16_t)0x2901));
+  tempCatDesc->setValue("Temperature CATASTROPHIC threshold (C)");
+  tempCatastrophicChar.addDescriptor(tempCatDesc);
+
+  BLEDescriptor* lightHighDesc = new BLEDescriptor(BLEUUID((uint16_t)0x2901));
+  lightHighDesc->setValue("Light HIGH threshold");
+  lightHighChar.addDescriptor(lightHighDesc);
+
+  BLEDescriptor* lightExtremeDesc = new BLEDescriptor(BLEUUID((uint16_t)0x2901));
+  lightExtremeDesc->setValue("Light EXTREME threshold");
+  lightExtremeChar.addDescriptor(lightExtremeDesc);
+
+  BLEDescriptor* lightCatDesc = new BLEDescriptor(BLEUUID((uint16_t)0x2901));
+  lightCatDesc->setValue("Light CATASTROPHIC threshold");
+  lightCatastrophicChar.addDescriptor(lightCatDesc);
+
+  //start services
+  lightService->start();
+  tempService->start();
+  server->getAdvertising()->addServiceUUID(BLE_TEMP_SERVICE_UUID);
   server->getAdvertising()->start();
   Serial.println("BLE advertising: " BLE_SERVER_NAME);
 }
 
-
-float get_temp() {
-  int adcValue = analogRead(PIN_ANALOG_IN);
-  if (adcValue <= 0 || adcValue >= 4095) return NAN;
-
-  double voltage = (double)adcValue / 4095.0 * 3.3;
-  double Rt = 10.0 * voltage / (3.3 - voltage);
-  double tempK = 1.0 / (1.0 / (273.15 + 25.0) + log(Rt / 10.0) / 3950.0);
-
-  return (float)(tempK - 273.15);
+void readTemperature() {
+  int adcValueTemp = analogRead(THERMISTOR_PIN); // Read Thermistor pin
+  double voltageTemp = (float)adcValueTemp / 4095.0 * 3.3; // Calculate voltage
+  double RtTemperature = 10 * voltageTemp / (3.3 - voltageTemp); // Calculate resistance value of thermistor
+  double tempK = 1 / (1/(273.15 + 25) + log(RtTemperature / 10)/3950.0); // Calculate temperature (Kelvin)
+  double tempC = tempK - 273.15; // Calculate temperature (Celsius)
+  temperature = tempC;
 }
 
-float get_light() {
-  int adc = analogRead(PIN_LIGHT);
-  float mapped = map(constrain(adc, 372, 2048), 372, 2048, 0, 4095);
-  return 4095.0f - mapped;
+void readLightLevel() {
+  int adcValueLight = analogRead(LDR_PIN); // Read LDR pin
+  lightLevel = constrain(
+    map(adcValueLight, LIGHT_MIN, LIGHT_MAX, 100, 0), 0, 100);
 }
 
-String get_status(float temperature, float light) {
-  bool hot = temperature > TEMP_THRESHOLD;
-  bool dark = light < LIGHT_THRESHOLD;
+void readWaterLevel() {
+  // make trigPin output high level lasting for 10us to trigger HC_SR04
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
 
-  if (hot && dark) return "HOT & DARK";
-  if (hot) return "HOT TEMPERSTURE WARNING";
-  if (dark) return "SMOKE WARNING";
-  return "NORMAL";
+  // Wait HC-SR04 returning to the high level and measure out this waiting time
+  pingTime = pulseIn(echoPin, HIGH, timeOut);
+
+  // calculate the distance according to the time
+  distance = (float)pingTime * soundVelocity / 2 / 10000;
+
+  waterPercentage = distance;
 }
 
-bool publishJson(const char* topic, JsonDocument& doc, size_t& bytes) {
+void readSensors() {
+  readTemperature();
+  readLightLevel();
+  readWaterLevel();
+}
+
+void calculateFireRisk() {
+  if (temperature > TEMP_CATASTROPHIC_THRESHOLD && lightLevel < LIGHT_CATASTROPHIC_THRESHOLD) {
+    fireRisk = FIRE_CATASTROPHIC;
+  } else if (temperature > TEMP_EXTREME_THRESHOLD && lightLevel < LIGHT_EXTREME_THRESHOLD) {
+    fireRisk = FIRE_EXTREME;
+  } else if (temperature > TEMP_HIGH_THRESHOLD && lightLevel < LIGHT_HIGH_THRESHOLD) {
+    fireRisk = FIRE_HIGH;
+  } else {
+    fireRisk = FIRE_MODERATE;
+  }
+}
+
+void calculateWaterStatus() {
+  if (waterPercentage < 10) {
+    waterStatus = WATER_CRITICAL;
+  } else if (waterPercentage < 30) {
+    waterStatus = WATER_LOW;
+  } else if (waterPercentage < 60) {
+    waterStatus = WATER_MODERATE;
+  } else {
+    waterStatus = WATER_FULL;
+  }
+}
+
+bool publishJson(const char* topic, JsonDocument& doc) {
   String payload;
   serializeJson(doc, payload);
-  bytes = payload.length(); 
-  publishAttempts++;
+  size_t bytes = payload.length(); 
   bool ok = mqtt.connected() && mqtt.publish(topic, payload.c_str());
-
-  if (!ok) publishFailures++;
   Serial.printf("MQTT %s [%s] (%u bytes): %s\n", ok ? "published" : "failed", topic, (unsigned)bytes, payload.c_str());
   return ok;
 }
@@ -145,33 +294,12 @@ void addTags(JsonDocument& doc) {
   doc["device_type"] = DEVICE_TYPE;
 }
 
-void publishPerformance() {
-  if (intervalPoints == 0) return;
-  JsonDocument doc;
-  addTags(doc);
-
-  doc["timestamp"] = (int64_t)time(nullptr);
-  doc["batch_bytes"] = intervalBytes;
-  doc["batch_points"] = intervalPoints;
-  doc["total_uploaded_bytes"] = totalPublishedBytes;
-  doc["total_uploaded_points"] = totalPublishedPoints;
-  doc["upload_attempts"] = publishAttempts;
-  doc["upload_failures"] = publishFailures;
-  double seconds = (millis() - sessionStart) / 1000.0;
-  doc["writing_rate_bps"] = seconds > 0 ? totalPublishedBytes / seconds : 0.0;
-  
-  size_t bytes = 0;
-  if (publishJson(TOPIC_PERFORMANCE, doc, bytes)) {
-    intervalBytes = 0;
-    intervalPoints = 0;
-  }
-}
-
 void collectSample() {
-  float temperature = get_temp();
-  float light = get_light();
-
-  if (isnan(temperature) || isnan(light)) {
+  readSensors();
+  calculateFireRisk();
+  calculateWaterStatus();
+  //check if any sensor values are null
+  if (isnan(temperature) || isnan(lightLevel) || isnan(waterPercentage)) {
     Serial.println("Invalid sensor reading; skipped");
     return;
   }
@@ -182,29 +310,17 @@ void collectSample() {
     return;
   }
   
-  if (temperature > TEMP_THRESHOLD || light < LIGHT_THRESHOLD) violations++;
   JsonDocument doc;
   addTags(doc);
-
   doc["timestamp"] = (int64_t)ts;
   doc["temperature"] = temperature;
-  doc["light"] = light;
-  doc["status"] = get_status(temperature, light);
-  doc["wifi_rssi"] = WiFi.RSSI();
+  doc["light"] = lightLevel;
+  doc["fire_status"] = fireRisk;
+  doc["water_status"] = waterStatus;
   doc["uptime"] = millis() / 1000;
   doc["upload_interval"] = SAMPLE_INTERVAL / 1000;
-  doc["temp_threshold"] = TEMP_THRESHOLD;
-  doc["light_threshold"] = LIGHT_THRESHOLD;
-  doc["violations"] = violations;
 
-  size_t bytes = 0;
-  if (publishJson(TOPIC_SENSOR, doc, bytes)) {
-    totalPublishedBytes += bytes;
-    totalPublishedPoints++;
-    intervalBytes += bytes;
-    intervalPoints++;
-    if (intervalPoints >= BATCH_SIZE) publishPerformance();
-  }
+  publishJson(TOPIC_SENSOR, doc);
 }
 
 void connectMqtt() {
@@ -219,7 +335,10 @@ void connectMqtt() {
 }
 
 void setup() {
+  pinMode(trigPin, OUTPUT); // set trigPin to output mode
+  pinMode(echoPin, INPUT); // set echoPin to input mode
   Serial.begin(115200);
+  Serial.println("Bushfire Response System Initialised");
   analogReadResolution(12);
   WiFi.mode(WIFI_STA);
   wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
@@ -246,6 +365,6 @@ void loop() {
   if (millis() - lastSample >= SAMPLE_INTERVAL) {
     lastSample = millis();
     if (mqtt.connected()) collectSample();
-    else Serial.println("MQTT offline; sample skipped");
+    else Serial.println("MQTT offline: sample skipped");
   }
 }
