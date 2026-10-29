@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <math.h>
+#include <Preferences.h>
 
 //DEVICE WIFI AND MQTT VARIABLES
 #define WIFI_SSID "Wiha Ratcheting Screwdriver"
@@ -24,6 +25,7 @@
 #define LOCATION "firestation"
 #define DEVICE_TYPE "ESP32"
 
+Preferences preferences;
 WiFiMulti wifiMulti;
 WiFiClient net;
 PubSubClient mqtt(net);
@@ -32,9 +34,7 @@ String deviceId;
 //BATCHING VARIABLES SETUP
 const unsigned long SAMPLE_INTERVAL = 2000;
 const unsigned long RETRY_INTERVAL = 5000;
-const int BATCH_SIZE = 3;
 unsigned long lastSample = 0, lastRetry = 0, sessionStart = 0;
-
 
 //BLE VARIABLES SETUP
 #define BLE_SERVER_NAME "fire_esp32"
@@ -102,13 +102,30 @@ void calculateFireRisk();
 void calculateWaterStatus();
 void printStatus();
 
+//LOAD SAVED THRESHOLDS
+void loadThresholds() {
+    preferences.begin("fire-config", true); 
+
+    TEMP_HIGH_THRESHOLD = preferences.getInt("tempHigh", 28);
+    TEMP_EXTREME_THRESHOLD = preferences.getInt("tempExtreme", 30);
+    TEMP_CATASTROPHIC_THRESHOLD = preferences.getInt("tempCat", 32);
+
+    LIGHT_HIGH_THRESHOLD = preferences.getInt("lightHigh", 80);
+    LIGHT_EXTREME_THRESHOLD = preferences.getInt("lightExtreme", 50);
+    LIGHT_CATASTROPHIC_THRESHOLD = preferences.getInt("lightCat", 20);
+
+    preferences.end();
+    Serial.println("Thresholds loaded from NVS");
+}
+
 class ThresholdCallback : public BLECharacteristicCallbacks {
 private:
     int* threshold;
     const char* name;
+    const char* memKey;
 
 public:
-    ThresholdCallback(int* thresholdPtr, const char* label) : threshold(thresholdPtr), name(label) {}
+    ThresholdCallback(int* thresholdPtr, const char* label, const char* key) : threshold(thresholdPtr), name(label), memKey(key) {}
 
     void onWrite(BLECharacteristic* characteristic) override {
         std::string value = characteristic->getValue();
@@ -134,6 +151,11 @@ public:
             Serial.println("Rejected: thresholds must remain ordered");
             return;
         }
+
+        //Open memory namespace to save new threshold
+        preferences.begin("fire-config", false);
+        size_t saved = preferences.putInt(memKey, *threshold);
+        preferences.end();
 
         characteristic->setValue(String(*threshold).c_str());
         Serial.print(name);
@@ -168,13 +190,13 @@ void setupBLE() {
   lightService->addCharacteristic(&lightCatastrophicChar);
 
   //assign callbacks to chars
-  tempHighChar.setCallbacks(new ThresholdCallback(&TEMP_HIGH_THRESHOLD, "Temperature HIGH"));
-  tempExtremeChar.setCallbacks(new ThresholdCallback(&TEMP_EXTREME_THRESHOLD, "Temperature EXTREME"));
-  tempCatastrophicChar.setCallbacks(new ThresholdCallback(&TEMP_CATASTROPHIC_THRESHOLD, "Temperature CATASTROPHIC"));
+  tempHighChar.setCallbacks(new ThresholdCallback(&TEMP_HIGH_THRESHOLD, "Temperature HIGH", "tempHigh"));
+  tempExtremeChar.setCallbacks(new ThresholdCallback(&TEMP_EXTREME_THRESHOLD, "Temperature EXTREME", "tempExtreme"));
+  tempCatastrophicChar.setCallbacks(new ThresholdCallback(&TEMP_CATASTROPHIC_THRESHOLD, "Temperature CATASTROPHIC", "tempCat"));
 
-  lightHighChar.setCallbacks(new ThresholdCallback(&LIGHT_HIGH_THRESHOLD, "Light HIGH"));
-  lightExtremeChar.setCallbacks(new ThresholdCallback(&LIGHT_EXTREME_THRESHOLD, "Light EXTREME"));
-  lightCatastrophicChar.setCallbacks(new ThresholdCallback(&LIGHT_CATASTROPHIC_THRESHOLD, "Light CATASTROPHIC"));
+  lightHighChar.setCallbacks(new ThresholdCallback(&LIGHT_HIGH_THRESHOLD, "Light HIGH", "lightHigh"));
+  lightExtremeChar.setCallbacks(new ThresholdCallback(&LIGHT_EXTREME_THRESHOLD, "Light EXTREME", "lightExtreme"));
+  lightCatastrophicChar.setCallbacks(new ThresholdCallback(&LIGHT_CATASTROPHIC_THRESHOLD, "Light CATASTROPHIC", "lightCat"));
 
   //assign threshold variables to chars
   tempHighChar.setValue(String(TEMP_HIGH_THRESHOLD).c_str());
@@ -213,6 +235,7 @@ void setupBLE() {
   //start services
   lightService->start();
   tempService->start();
+  server->getAdvertising()->addServiceUUID(BLE_LIGHT_SERVICE_UUID);
   server->getAdvertising()->addServiceUUID(BLE_TEMP_SERVICE_UUID);
   server->getAdvertising()->start();
   Serial.println("BLE advertising: " BLE_SERVER_NAME);
@@ -298,11 +321,6 @@ void collectSample() {
   readSensors();
   calculateFireRisk();
   calculateWaterStatus();
-  //check if any sensor values are null
-  if (isnan(temperature) || isnan(lightLevel) || isnan(waterPercentage)) {
-    Serial.println("Invalid sensor reading; skipped");
-    return;
-  }
 
   time_t ts = time(nullptr);
   if (ts < 1700000000) {
@@ -317,6 +335,7 @@ void collectSample() {
   doc["light"] = lightLevel;
   doc["fire_status"] = fireRisk;
   doc["water_status"] = waterStatus;
+  doc["water_percentage"] = waterPercentage;
   doc["uptime"] = millis() / 1000;
   doc["upload_interval"] = SAMPLE_INTERVAL / 1000;
 
@@ -338,12 +357,16 @@ void setup() {
   pinMode(trigPin, OUTPUT); // set trigPin to output mode
   pinMode(echoPin, INPUT); // set echoPin to input mode
   Serial.begin(115200);
+  loadThresholds();
   Serial.println("Bushfire Response System Initialised");
   analogReadResolution(12);
   WiFi.mode(WIFI_STA);
   wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
 
-  while (wifiMulti.run() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  while (wifiMulti.run() != WL_CONNECTED) { 
+    delay(500); 
+    Serial.print("."); 
+  }
   Serial.println("\nWiFi connected");
   deviceId = WiFi.macAddress();
 
