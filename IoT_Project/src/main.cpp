@@ -13,15 +13,14 @@
 #include <Preferences.h>
 
 //DEVICE WIFI AND MQTT VARIABLES
-#define WIFI_SSID "Wiha Ratcheting Screwdriver"
-#define WIFI_PASSWORD "house101"
+#define WIFI_SSID "NETWORKNAME"
+#define WIFI_PASSWORD "NETWORKPWD"
 #define MQTT_HOST "broker.emqx.io"
 #define MQTT_PORT 1883
 
 #define TOPIC_SENSOR "firestation_esp32/sensors"
 #define TZ_INFO "AEST-10AEDT,M10.1.0,M4.1.0/3"
 
-#define GROUP_ID "Group1"
 #define LOCATION "firestation"
 #define DEVICE_TYPE "ESP32"
 
@@ -294,7 +293,7 @@ void calculateWaterStatus() {
     waterStatus = WATER_CRITICAL;
   } else if (waterPercentage < 30) {
     waterStatus = WATER_LOW;
-  } else if (waterPercentage < 60) {
+  } else if (waterPercentage < 80) {
     waterStatus = WATER_MODERATE;
   } else {
     waterStatus = WATER_FULL;
@@ -311,7 +310,6 @@ bool publishJson(const char* topic, JsonDocument& doc) {
 }
 
 void addTags(JsonDocument& doc) {
-  doc["group"] = GROUP_ID;
   doc["device_id"] = deviceId;
   doc["location"] = LOCATION;
   doc["device_type"] = DEVICE_TYPE;
@@ -360,6 +358,7 @@ void setup() {
   loadThresholds();
   Serial.println("Bushfire Response System Initialised");
   analogReadResolution(12);
+
   WiFi.mode(WIFI_STA);
   wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
 
