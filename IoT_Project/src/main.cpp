@@ -14,7 +14,7 @@
 
 //DEVICE WIFI AND MQTT VARIABLES
 #define WIFI_SSID "NETWORKNAME"
-#define WIFI_PASSWORD "NETWORKPWD"
+#define WIFI_PASSWORD "NETWORKPASSWORD"
 #define MQTT_HOST "broker.emqx.io"
 #define MQTT_PORT 1883
 
@@ -127,8 +127,8 @@ public:
     ThresholdCallback(int* thresholdPtr, const char* label, const char* key) : threshold(thresholdPtr), name(label), memKey(key) {}
 
     void onWrite(BLECharacteristic* characteristic) override {
-        std::string value = characteristic->getValue();
-        if (value.empty()) return;
+        String value = characteristic->getValue();
+        if (value.isEmpty()) return;
 
         //check if input is wihtin bounds
         char* endPtr;
@@ -267,7 +267,8 @@ void readWaterLevel() {
   // calculate the distance according to the time
   distance = (float)pingTime * soundVelocity / 2 / 10000;
 
-  waterPercentage = distance;
+  waterPercentage = ((13.0 - distance) / (13.0 - 3.0)) * 100.0;
+  waterPercentage = constrain(waterPercentage, 0, 100);
 }
 
 void readSensors() {
